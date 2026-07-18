@@ -4,6 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "dev": "bun services/api_gateway.ts",
     "db:generate": "bun --bun drizzle-kit generate",
     "db:migrate": "bun --bun drizzle-kit migrate",
     "db:push": "bun --bun drizzle-kit push"
@@ -17,6 +18,7 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "drizzle-orm": "^1.0.0-rc.4"
+    "drizzle-orm": "^1.0.0-rc.4",
+    "zod": "^4.4.3"
   }
 }
