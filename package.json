@@ -4,7 +4,9 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "bun services/api_gateway.ts",
+    "dev": "bun index.ts",
+    "dev:gateway": "bun services/gateway.ts",
+    "dev:processor": "bun services/processor.ts",
     "db:generate": "bun --bun drizzle-kit generate",
     "db:migrate": "bun --bun drizzle-kit migrate",
     "db:push": "bun --bun drizzle-kit push"
