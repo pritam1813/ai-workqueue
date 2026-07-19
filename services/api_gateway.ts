@@ -1,6 +1,7 @@
 import { db } from "../database/client";
 import { jobs } from "../database/schema";
 import { ProcessRequest } from "../shared/types";
+import { channel, queue } from "./message_broker";
 
 const server = Bun.serve({
   port: 3000,
@@ -24,6 +25,8 @@ const server = Bun.serve({
               { status: 500 },
             );
           }
+
+          channel.sendToQueue(queue, Buffer.from(job.id.toString()));
 
           return Response.json({ jobId: job.id });
         } catch (error) {

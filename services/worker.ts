@@ -31,15 +31,5 @@ Bun.serve({
         },
       });
     },
-
-    // Trigger endpoint for manual testing — remove when RabbitMQ is wired up.
-    "/jobs/:id/trigger": {
-      POST: async (req) => {
-        const jobId = req.params.id;
-        const { status } = await req.json();
-        jobEvents.emit(jobId, status);
-        return Response.json({ ok: true });
-      },
-    },
   },
 });

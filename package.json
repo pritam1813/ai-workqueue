@@ -18,6 +18,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "amqplib": "^2.0.1",
     "drizzle-orm": "^1.0.0-rc.4",
     "zod": "^4.4.3"
   }
