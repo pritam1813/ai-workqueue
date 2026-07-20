@@ -3,34 +3,8 @@ import { jobs } from "../database/schema";
 import { channel, QUEUE_NAME } from "./broker";
 import { JOB_EVENTS_CHANNEL } from "../shared/events";
 import { ProcessRequest } from "../shared/types";
-import type { JobPayload, JobEvent } from "../shared/types";
-
-// Each Worker thread gets its own BroadcastChannel instance.
-// Bun connects all instances sharing the same name within the same process.
-const broadcast = new BroadcastChannel(JOB_EVENTS_CHANNEL);
-
-// In-memory map of jobId → SSE stream controller for active connections.
-// When a job event arrives via BroadcastChannel, we look up the controller
-// and push the update directly — no polling needed.
-const sseClients = new Map<number, ReadableStreamDefaultController<string>>();
-
-// Listen for job events from the processor thread and push to SSE streams
-broadcast.onmessage = (event: MessageEvent<JobEvent>) => {
-  const { jobId, status, result, error } = event.data;
-  const controller = sseClients.get(jobId);
-
-  if (!controller) return; // client may have disconnected
-
-  controller.enqueue(
-    `data: ${JSON.stringify({ status, result, error })}\n\n`,
-  );
-
-  // Close the SSE stream once the job reaches a terminal state
-  if (status === "completed" || status === "failed") {
-    controller.close();
-    sseClients.delete(jobId);
-  }
-};
+import type { JobPayload } from "../shared/types";
+import { RedisClient } from "bun";
 
 const server = Bun.serve({
   port: 3000,
@@ -74,6 +48,8 @@ const server = Bun.serve({
 
           return Response.json({ jobId: job.id }, { status: 202 });
         } catch (error) {
+          console.error(error);
+
           return Response.json(
             { error: "Invalid request body" },
             { status: 400 },
@@ -91,17 +67,41 @@ const server = Bun.serve({
       if (isNaN(jobId)) {
         return new Response("Invalid job ID", { status: 400 });
       }
+      const listener = new RedisClient(
+        process.env.REDIS_URL ?? "redis://localhost:6379",
+      );
+      let cancelled = false;
 
       const stream = new ReadableStream<string>({
-        start(controller) {
-          sseClients.set(jobId, controller);
+        async start(controller) {
+          await listener.connect();
+
+          await listener.subscribe(
+            `${JOB_EVENTS_CHANNEL}:${jobId}`,
+            (message) => {
+              if (cancelled) return; // stream was cancelled before message arrived
+              controller.enqueue(`data: ${message}\n\n`);
+
+              // Close stream on terminal status
+              let parsed: { status: string };
+              try {
+                parsed = JSON.parse(message);
+              } catch {
+                return;
+              }
+              if (parsed.status === "completed" || parsed.status === "failed") {
+                controller.close();
+              }
+            },
+          );
 
           // Send an initial ping so the client knows the connection is open
-          controller.enqueue(`: connected\n\n`);
+          controller.enqueue(": connected\n\n");
         },
         cancel() {
           // Client disconnected — clean up to avoid memory leaks
-          sseClients.delete(jobId);
+          cancelled = true;
+          listener.close();
         },
       });
 

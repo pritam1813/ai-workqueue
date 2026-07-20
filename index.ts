@@ -1,11 +1,10 @@
 /**
  * Entry point — spawns gateway and processor as separate Bun Worker threads.
  *
- * Running both in the same process means:
- * - BroadcastChannel connects them without any external infrastructure (no Redis)
- * - Bun's module cache is NOT shared between workers (each thread is isolated)
- * - Each worker gets its own AMQP connection (gateway = publisher, processor = consumer)
- * - If processor crashes, gateway stays alive — users can still submit jobs
+ * Both workers communicate job status via Redis Pub/Sub (not BroadcastChannel),
+ * so they could also run as fully separate processes if needed.
+ * - Gateway:   publishes jobs to RabbitMQ, subscribes to Redis for SSE pushes
+ * - Processor: consumes from RabbitMQ, publishes status updates to Redis
  */
 
 const gatewayWorker = new Worker(

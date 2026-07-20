@@ -3,11 +3,15 @@ import { db } from "../database/client";
 import { jobs } from "../database/schema";
 import { channel, QUEUE_NAME } from "./broker";
 import { JOB_EVENTS_CHANNEL } from "../shared/events";
-import type { JobPayload, JobEvent } from "../shared/types";
+import type { JobPayload } from "../shared/types";
+import { RedisClient } from "bun";
 
-// Each Worker thread gets its own BroadcastChannel instance.
-// Bun connects all instances sharing the same name within the same process.
-const broadcast = new BroadcastChannel(JOB_EVENTS_CHANNEL);
+// Redis publisher — used to notify the gateway of job status changes.
+// A dedicated connection is required for publishing (cannot share with subscriber).
+const writer = new RedisClient(
+  process.env.REDIS_URL ?? "redis://localhost:6379",
+);
+await writer.connect();
 
 // Assert queue on startup — processor owns this declaration.
 await channel.assertQueue(QUEUE_NAME, {
@@ -46,11 +50,11 @@ channel.consume(
         .set({ status: "processing" })
         .where(eq(jobs.id, jobId));
 
-      // 2. Notify gateway thread → client SSE stream
-      broadcast.postMessage({
-        jobId,
-        status: "processing",
-      } satisfies JobEvent);
+      // 2. Publish status to Redis — gateway subscriber will push to SSE stream
+      await writer.publish(
+        `${JOB_EVENTS_CHANNEL}:${jobId}`,
+        JSON.stringify({ status: "processing" }),
+      );
 
       // 3. Call AI model with the file URL
       const result = await processWithAI(inputUrl);
@@ -61,12 +65,11 @@ channel.consume(
         .set({ status: "completed", result })
         .where(eq(jobs.id, jobId));
 
-      // 5. Notify gateway thread → client SSE stream
-      broadcast.postMessage({
-        jobId,
-        status: "completed",
-        result,
-      } satisfies JobEvent);
+      // 5. Publish status + result to Redis
+      await writer.publish(
+        `${JOB_EVENTS_CHANNEL}:${jobId}`,
+        JSON.stringify({ status: "completed", result }),
+      );
 
       // 6. ACK only after everything succeeded — RabbitMQ won't re-deliver
       channel.ack(msg);
@@ -79,17 +82,13 @@ channel.consume(
       console.error(`[processor] Job ${jobId} failed:`, errorMessage);
 
       // Update DB to failed
-      await db
-        .update(jobs)
-        .set({ status: "failed" })
-        .where(eq(jobs.id, jobId));
+      await db.update(jobs).set({ status: "failed" }).where(eq(jobs.id, jobId));
 
-      // Notify gateway thread → client SSE stream
-      broadcast.postMessage({
-        jobId,
-        status: "failed",
-        error: errorMessage,
-      } satisfies JobEvent);
+      // Publish failure status to Redis
+      await writer.publish(
+        `${JOB_EVENTS_CHANNEL}:${jobId}`,
+        JSON.stringify({ status: "failed", error: errorMessage }),
+      );
 
       // NACK without requeue — let the Dead Letter Queue handle retries
       channel.nack(msg, false, false);
