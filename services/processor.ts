@@ -5,6 +5,7 @@ import { channel, QUEUE_NAME } from "./broker";
 import { JOB_EVENTS_CHANNEL } from "../shared/events";
 import type { JobPayload } from "../shared/types";
 import { RedisClient } from "bun";
+import { GoogleGenAI } from "@google/genai";
 
 // Redis publisher — used to notify the gateway of job status changes.
 // A dedicated connection is required for publishing (cannot share with subscriber).
@@ -21,9 +22,11 @@ await channel.assertQueue(QUEUE_NAME, {
   },
 });
 
-// Limit to 3 concurrent jobs — this is your Gemini API rate limiter.
-// RabbitMQ will not deliver a 4th message until one of the 3 is ACK'd.
-await channel.prefetch(3);
+// prefetch(1): Only hold 1 unacknowledged message at a time.
+// This is the backpressure signal — RabbitMQ will not deliver the next job
+// until the current one is ACK'd. Combined with the rate limiter in
+// processWithAI(), this guarantees we never exceed 5 requests/min.
+await channel.prefetch(1);
 
 console.log("[processor] Ready — waiting for jobs in queue:", QUEUE_NAME);
 
@@ -101,17 +104,108 @@ channel.consume(
   },
 );
 
-/**
- * Placeholder for Gemini API integration.
- * Replace with actual @google/generative-ai call.
- */
-async function processWithAI(inputUrl: string): Promise<string> {
-  // TODO: replace with actual Gemini API call
-  // const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-  // const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
-  // const result = await model.generateContent([{ fileData: { fileUri: inputUrl } }]);
-  // return result.response.text();
+// ---------------------------------------------------------------------------
+// Rate Limiter
+// ---------------------------------------------------------------------------
+// Free tier: 5 requests per minute → 1 request every 12 seconds minimum.
+// We track the timestamp of the last Gemini call and sleep the difference
+// before every new call. This is proactive throttling — we never exceed the
+// quota in the first place rather than reacting to 429s after the fact.
+// ---------------------------------------------------------------------------
+const RPM_LIMIT = 5;
+const MIN_INTERVAL_MS = (60 / RPM_LIMIT) * 1000; // 12,000ms
+let lastCallTime = 0;
 
-  await Bun.sleep(5000); // simulate network + AI processing time
-  return `Analysis complete for: ${inputUrl}`;
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+/**
+ * Parses the retry delay (in ms) from a Gemini 429 error message.
+ * The API returns strings like "Please retry in 15.56s".
+ * Returns null if the error is not a 429 or delay cannot be parsed.
+ */
+function parseRetryDelay(error: unknown): number | null {
+  if (!(error instanceof Error)) return null;
+
+  const message = error.message;
+
+  // Only handle rate limit and overload errors
+  if (!message.includes("429") && !message.includes("503")) return null;
+
+  const match = message.match(/retry in (\d+(?:\.\d+)?)s/i);
+  if (match) return Math.ceil(parseFloat(match[1]!)) * 1000;
+
+  // Fallback if retry delay isn't in the message
+  return 60_000;
+}
+
+/**
+ * Calls the Gemini API with proactive rate limiting and retry-on-429 logic.
+ *
+ * Flow:
+ *  1. Sleep until 12s have elapsed since the last call (proactive throttle)
+ *  2. Call Gemini
+ *  3. If 429/503, sleep the API-provided retryDelay and try again (max 3 attempts)
+ */
+/**
+ * Reads text content from either a remote HTTP URL or a local file:// URI.
+ * Test scripts pass file:// URIs (e.g. new URL("./sample.txt", import.meta.url).href)
+ * so no external HTTP server is needed for local testing.
+ */
+async function getTextContent(inputUrl: string): Promise<string> {
+  if (inputUrl.startsWith("file://")) {
+    return await Bun.file(new URL(inputUrl)).text();
+  }
+  const response = await fetch(inputUrl);
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch input URL: ${response.status} ${response.statusText}`,
+    );
+  }
+  return await response.text();
+}
+
+async function processWithAI(inputUrl: string, attempt = 1): Promise<string> {
+  // --- Proactive throttle ---
+  const elapsed = Date.now() - lastCallTime;
+  const waitTime = MIN_INTERVAL_MS - elapsed;
+
+  if (waitTime > 0) {
+    console.log(
+      `[processor] Rate limiter: waiting ${(waitTime / 1000).toFixed(1)}s before next Gemini call`,
+    );
+    await Bun.sleep(waitTime);
+  }
+
+  // Record the call time before the request so parallel paths
+  // (if prefetch is ever raised) also see the correct timestamp.
+  lastCallTime = Date.now();
+
+  try {
+    console.log(`[processor] Reading content from: ${inputUrl}`);
+    const textData = await getTextContent(inputUrl);
+
+    console.log(`[processor] Calling Gemini (attempt ${attempt}/3)...`);
+    const result = await ai.models.generateContent({
+      model: "gemini-3.1-flash-lite",
+      contents: `Please summarize the following text in one sentence:\n\n${textData.substring(0, 2000)}`,
+    });
+
+    return result.text || "No result generated.";
+  } catch (error) {
+    // --- Reactive retry (safety net for unexpected 429/503) ---
+    const retryDelay = parseRetryDelay(error);
+
+    if (retryDelay !== null && attempt <= 3) {
+      console.warn(
+        `[processor] Got rate-limit/overload error. Retrying in ${retryDelay / 1000}s (attempt ${attempt}/3)`,
+      );
+      // Reset lastCallTime so the proactive throttle doesn't add extra wait on top
+      lastCallTime = 0;
+      await Bun.sleep(retryDelay);
+      return processWithAI(inputUrl, attempt + 1);
+    }
+
+    // Non-retryable error or exhausted retries — bubble up to the consumer
+    throw error;
+  }
 }

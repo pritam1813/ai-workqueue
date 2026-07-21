@@ -9,7 +9,10 @@
     "dev:processor": "bun services/processor.ts",
     "db:generate": "bun --bun drizzle-kit generate",
     "db:migrate": "bun --bun drizzle-kit migrate",
-    "db:push": "bun --bun drizzle-kit push"
+    "db:push": "bun --bun drizzle-kit push",
+    "test:direct": "bun tests/direct-rate-limit.ts",
+    "test:queue": "bun tests/queue-rate-limit.ts",
+    "test:load": "bun tests/load-test.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",
@@ -20,6 +23,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@google/genai": "^2.12.0",
     "amqplib": "^2.0.1",
     "drizzle-orm": "^1.0.0-rc.4",
     "zod": "^4.4.3"
